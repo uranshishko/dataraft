@@ -1,6 +1,10 @@
+<p align="center">
+  <img src="/images/gopher_dataraft.png" alt="Gopher with a DataRaft"/>
+</p>
+
 # DataRaft – Type-safe, concurrent ETL for Go
 
-`dataraft` is a **generic, type-safe, concurrent ETL (Extract, Transform, Load) library** for Go. It supports **typed records with IDs**, concurrent pipelines, retries with backoff, execution history, and scheduling for recurring jobs.
+`dataraft` is a **generic, type-safe, concurrent ETL (Extract, Transform, Load) library** for Go. It provides a composable pipeline with typed records, concurrency, retries, execution tracking, and scheduling.
 
 ---
 
@@ -14,13 +18,15 @@ go get github.com/uranshishko/dataraft
 
 ## Key Concepts
 
-- **TypedJob[TIn, TOut]** – a generic job that extracts, transforms, and loads data.
-- **Record[T] / TransformedRecord[T]** – wrapper types for source data and transformed results, each with a unique ID.
-- **PipelineResult** – holds batch execution results and errors.
-- **Orchestrator** – central manager for registering, executing, and tracking jobs.
-- **Scheduler** – schedules recurring jobs at specified intervals.
-- **RetryConfig** – configure retries with exponential backoff.
-- **ExecutionResult** – tracks detailed execution info (status, attempts, duration, errors, metadata).
+- **TypedJob[TIn, TOut]** – defines a full ETL job
+- **Record[T]** – input record with ID and data
+- **TransformedRecord[T]** – output record after transformation
+- **DataSource[T]** – produces records via channel
+- **DataLoader[T]** – consumes transformed records via channel
+- **PipelineResult** – tracks processed/failed records and errors
+- **Orchestrator** – runs and manages jobs
+- **Scheduler** – runs jobs on intervals
+- **RetryConfig** – retry strategy with backoff
 
 ---
 
@@ -40,19 +46,25 @@ package main
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/uranshishko/dataraft"
 )
 
-// Dummy source returning numbers
 type intSource struct{}
-func (s *intSource) Fetch(ctx context.Context) ([]int, error) { return []int{1, 2, 3}, nil }
 
-// Dummy loader printing results for demonstration
+func (s *intSource) Extract(ctx context.Context, out chan<- dataraft.Record[int]) error {
+	for i := 1; i <= 5; i++ {
+		out <- dataraft.Record[int]{ID: int64(i), Data: i}
+	}
+	return nil
+}
+
 type intLoader struct{}
-func (l *intLoader) Load(ctx context.Context, records []int) error {
-	fmt.Println("Loaded:", records)
+
+func (l *intLoader) Load(ctx context.Context, in <-chan dataraft.TransformedRecord[int]) error {
+	for r := range in {
+		fmt.Println("Loaded:", r.Result)
+	}
 	return nil
 }
 
@@ -78,7 +90,7 @@ func main() {
 	_ = orch.RegisterJob(job)
 
 	result, _ := orch.ExecuteJob(context.Background(), "double", nil)
-	fmt.Println("Execution status:", result.GetStatus())
+	fmt.Println("Status:", result.GetStatus())
 }
 ```
 
@@ -97,119 +109,244 @@ import (
 	"github.com/uranshishko/dataraft"
 )
 
-// Simple job that prints a message
-type printJob struct{ message string }
+type printJob struct{}
 
-func (j *printJob) Name() string        { return "printJob" }
-func (j *printJob) Description() string { return "Prints a message" }
+func (j *printJob) Name() string        { return "print" }
+func (j *printJob) Description() string { return "prints a message" }
+
 func (j *printJob) Execute(ctx context.Context) (*dataraft.PipelineResult, error) {
-	fmt.Println(j.message)
+	fmt.Println("Hello from scheduler")
 	return &dataraft.PipelineResult{}, nil
 }
 
 func main() {
 	orch := dataraft.NewOrchestrator(nil)
-	job := &printJob{message: "Hello from scheduled job!"}
 
-	_ = orch.RegisterJob(job)
-	_ = orch.Scheduler().AddSchedule("printJob", 1*time.Second)
+	_ = orch.RegisterJob(&printJob{})
+	_ = orch.Scheduler().AddSchedule("print", 1*time.Second)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+
 	orch.Scheduler().Start(ctx)
 }
 ```
 
-> **Note:** Scheduled jobs may run multiple times depending on the ticker interval.
+---
+
+## Homebrew Monitoring Example
+
+While `dataraft` does not include a built-in UI, you can easily build lightweight monitoring using the orchestrator APIs.
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/uranshishko/dataraft"
+)
+
+func main() {
+	orch := dataraft.NewOrchestrator(nil)
+
+	// Register jobs (example assumes jobs already exist)
+	_ = orch.RegisterJob(job1)
+	_ = orch.RegisterJob(job2)
+
+	// Setup scheduler
+	scheduler := orch.Scheduler()
+	_ = scheduler.AddSchedule("job-1", 1*time.Hour)
+	_ = scheduler.AddSchedule("job-2", 6*time.Hour)
+
+	// Start scheduler
+	ctx := context.Background()
+	go scheduler.Start(ctx)
+
+	// Print registered jobs
+	fmt.Println("\nRegistered Jobs:")
+	for _, info := range orch.ListJobs() {
+		fmt.Printf("  - %s: %s\n", info.Name, info.Description)
+	}
+
+	// Simple monitoring loop
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			active := orch.GetActiveExecutions()
+			recent := orch.GetRecentExecutions(5)
+
+			fmt.Println("\n📊 Status Report:")
+
+			// Active executions
+			fmt.Printf("Active executions: %d\n", len(active))
+			for _, id := range active {
+				fmt.Printf("  - %s\n", id)
+			}
+
+			// Recent executions
+			fmt.Println("Recent executions:")
+			for _, exec := range recent {
+				fmt.Printf(
+					"  - %s [%s] (%s, attempt %d)\n",
+					exec.JobName,
+					exec.Status,
+					exec.Duration,
+					exec.Attempt,
+				)
+			}
+		}
+	}()
+
+	// Keep app running
+	select {}
+}
+```
+
+## Prometheus metrics monitoring
+
+You can also use the `dataraft` orchestrator to export Prometheus metrics for monitoring and alerting. This can be useful for monitoring the health and performance of your ETL pipelines.
+
+```go
+package main
+
+import (
+	"context"
+	"net/http"
+	"time"
+
+	"github.com/uranshishko/dataraft"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+func main() {
+	orch := dataraft.NewOrchestrator(nil)
+
+	// Example jobs (assume job1 and job2 are already defined)
+	_ = orch.RegisterJob(job1)
+	_ = orch.RegisterJob(job2)
+
+	// Scheduler setup
+	scheduler := orch.Scheduler()
+	_ = scheduler.AddSchedule("job-1", 1*time.Hour)
+	_ = scheduler.AddSchedule("job-2", 6*time.Hour)
+	go scheduler.Start(context.Background())
+
+	// Prometheus metrics
+	activeJobs := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "dataraft_active_jobs",
+		Help: "Number of active job executions",
+	})
+	recentExecutions := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "dataraft_job_executions_total",
+			Help: "Total number of job executions by status",
+		},
+		[]string{"job", "status"},
+	)
+
+	prometheus.MustRegister(activeJobs, recentExecutions)
+
+	// Monitoring loop
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			active := orch.GetActiveExecutions()
+			activeJobs.Set(float64(len(active)))
+
+			for _, exec := range orch.GetRecentExecutions(10) {
+				recentExecutions.WithLabelValues(exec.JobName, string(exec.Status)).Inc()
+			}
+		}
+	}()
+
+	// Expose Prometheus endpoint
+	http.Handle("/metrics", promhttp.Handler())
+	http.ListenAndServe(":2112", nil)
+}
+```
 
 ---
 
-## Functional Options for Jobs
+## Job Configuration
 
 ```go
 job := dataraft.NewTypedJob(
-	"example",
-	"Example job",
+	"name",
+	"description",
 	source,
 	transform,
 	loader,
-	2,
-	10,
-	dataraft.WithTimeout[int, int](time.Minute),
-	dataraft.WithRetry[int, int](&dataraft.RetryConfig{
+	workers,
+	batchSize,
+).
+	WithTimeout(2 * time.Minute).
+	WithRetry(&dataraft.RetryConfig{
 		MaxAttempts:   3,
 		InitialDelay:  time.Second,
 		MaxDelay:      5 * time.Second,
-		BackoffFactor: 2.0,
-	}),
-)
+		BackoffFactor: 2,
+	})
 ```
 
-- `WithTimeout` sets a maximum job duration.
-- `WithRetry` configures retries and backoff.
+---
 
-> Functional options provide a **cleaner, immutable-style API** compared to setters.
+## Execution Tracking
+
+```go
+result, _ := orch.ExecuteJob(ctx, "double", nil)
+
+fmt.Println(result.Status)
+fmt.Println(result.Duration)
+fmt.Println(result.Attempt)
+```
 
 ---
 
 ## Execution History
 
 ```go
-orch := dataraft.NewOrchestrator(nil)
-executions := orch.GetRecentExecutions(10) // most recent 10
-history := orch.GetJobHistory("double", 5) // last 5 executions
+recent := orch.GetRecentExecutions(10)
+history := orch.GetJobHistory("double", 5)
 ```
-
-Each `ExecutionResult` provides:
-
-- `Status` (Pending, Running, Completed, Failed, Cancelled, Retrying)
-- `StartTime`, `EndTime`, `Duration`
-- `Attempt` count
-- `PipelineResult` and `Error`
-- Optional metadata
 
 ---
 
-## Cancel Running Jobs
+## Cancel Execution
 
 ```go
-result, _ := orch.ExecuteJob(ctx, "double", nil)
-err := orch.CancelExecution(result.ExecutionID)
+res, _ := orch.ExecuteJob(ctx, "double", nil)
+_ = orch.CancelExecution(res.ExecutionID)
 ```
-
-Cancels an active execution and updates its status to `CANCELLED`.
 
 ---
 
-## Custom Retry Strategy
+## Retry Configuration
 
 ```go
 retry := &dataraft.RetryConfig{
 	MaxAttempts:   3,
-	InitialDelay:  1 * time.Second,
+	InitialDelay:  time.Second,
 	MaxDelay:      10 * time.Second,
 	BackoffFactor: 2,
 }
-
-job := dataraft.NewTypedJob(
-	"exampleRetry",
-	"Job with retries",
-	source,
-	transform,
-	loader,
-	2,
-	10,
-	dataraft.WithRetry(retry),
-)
 ```
 
 ---
 
-## Notes on Concurrency
+## Concurrency Notes
 
-- `DataRaft` pipelines and schedulers are **concurrent**.
-- When running tests with `--race`, job execution order may vary, and scheduled jobs may print multiple times.
-- Execution history and results are **thread-safe**.
+- Pipelines run with multiple workers
+- Ordering is **not guaranteed**
+- Scheduler timing is approximate (ticker-based)
+- Safe for concurrent use
 
 ---
 
